@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "lisp.h"
 
 struct vgaslot {
 	uint8_t chr, color;
@@ -77,33 +78,6 @@ void puts(const char *s) {
 	flush();
 }
 
-template<typename t>
-void puti_loop(t i) {
-	int digit = i % 10, rest = i / 10;
-	if (rest > 0) puti_loop(rest);
-	putc('0' + digit);
-}
-
-template<typename t>
-void puti(t i) {
-	if (i == 0) putc('0');
-	else if (i < 0) {
-		putc('-');
-		puti_loop(-i);
-	} else {
-		puti_loop(i);
-	}
-}
-
-// unsigned specialization
-template<typename t>
-void putu(t i) {
-	if (i == 0) putc('0');
-	else {
-		puti_loop(i);
-	}
-}
-
 struct memblock {
 	uint8_t *start;
 	uint64_t length;
@@ -131,7 +105,7 @@ void usable_memory(void) {
 	}
 }
 
-void fail(void) __attribute__((noreturn)) {
+void fail(void) {
 	puts("\nDEAD");
 	while(1);
 }
@@ -183,9 +157,9 @@ volatile int pause = 1;
 extern "C"
 void kmain() {
 	puts("kernel started\n");
-//	while (pause);
+	// while (pause);
 	find_arena();
-	usable_memory();
+	lisp_init(arena, arenalen);
 	spin();
 	while(1);
 }
