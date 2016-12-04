@@ -13,7 +13,17 @@ pair<t, q> make_pair(t l, q r) {
 	return { l, r };
 }
 
-void putsym(symentry *sym) {
+inline tag type_of(object *obj) {
+	return obj == nullptr ? tnil : obj->type;
+}
+
+template<typename t>
+t *as(object *val) {
+	assert(type_of(val) == t::ttag, "bad cast");
+	return (t*)val;
+}
+
+void putsym(symbol *sym) {
 	for (int i = 0; i < sym->length; ++i) {
 		putc_(sym->chars[i]);
 	}
@@ -24,31 +34,35 @@ constexpr size_t SYMTBLSZ = 4096;
 uint8_t symtbl[SYMTBLSZ];
 int32_t symind = 0;
 
-symentry *intern_strl(const char *str, size_t len) {
+symbol *intern_strl(const char *str, size_t len) {
 	assert(len < 256, "string too long for interning");
 	uint8_t *loc = symtbl;
 
+	// symbol: label byte, length byte, chars
 	while (loc < symtbl + symind) {
-		uint8_t len1 = loc[0];
-		if (len == len1 && memcmp((uint8_t*)str,loc+1, len) == 0) {
-			return (symentry*)loc;
+		uint8_t len1 = loc[1];
+		if (len == len1 && memcmp((uint8_t*)str,loc+2, len) == 0) {
+			return (symbol*)loc;
 		} else {
-			loc += len1 + 1;
+			loc += len1 + 2;
 		}
 	}
 
-	assert(symind + len + 1 < SYMTBLSZ, "too many symbols in symtbl");
-	loc[0] = len;
-	memcpy(loc+1, (uint8_t*)str, len);
-	symind += len + 1;
-	return (symentry*)loc;	
+	assert(symind + len + 2 < SYMTBLSZ, "too many symbols in symtbl");
+	loc[0] = tsymbol;
+	loc[1] = len;
+	memcpy(loc+2, (uint8_t*)str, len);
+	symind += len + 2;
+	return (symbol*)loc;	
 }
 
-symentry *intern_cstr(const char *str) {
+symbol *intern_cstr(const char *str) {
 	return intern_strl(str, strlen(str));
 }
 
-symentry *sym_def;
+symbol *sym_def;
+symbol *sym_quote;
+symbol *sym_if;
 
 uint8_t *leftspace;
 uint8_t *rightspace;
@@ -98,12 +112,6 @@ fixnum *alloc_fixnum(int64_t val) {
 	return ret;
 }
 
-symbol *alloc_symbol(symentry *sym) {
-	symbol *ret = gcalloc<symbol>();
-	ret->sym = sym;
-	return ret;
-}
-
 void setup_arena(uint8_t *memory, size_t memlen) {
 	spacesize = (memlen / 2) & ~0x7;
 	leftspace = memory;
@@ -115,17 +123,13 @@ void setup_arena(uint8_t *memory, size_t memlen) {
 binding globals[1024];
 uint64_t globalind = 0;
 
-void add_global(symentry *sym, object *val, bool is_macro) {
+void add_global(symbol *sym, object *val, bool is_macro) {
 	assert(globalind < countof(globals), "too many globals!");
 	globals[globalind++] = { sym, val, is_macro };
 }
 
 void add_primop(const char *name, primop prim) {
 	add_global(intern_cstr(name), alloc_cfunc(prim), 0);
-}
-
-inline tag type_of(object *obj) {
-	return obj == nullptr ? tnil : obj->type;
 }
 
 // proper floored div/mod
@@ -153,6 +157,12 @@ namespace prim {
 		int64_t x = ((fixnum*)argv[0])->val, y = ((fixnum*)argv[1])->val; \
 		return alloc_fixnum(exp);										\
 	}
+#define INT_MONAD(name, exp) object *name(int argc, object **argv) {		\
+		assert(argc == 1, "wrong #args to prim");						\
+		assert(type_of(argv[0]) == tfixnum, "non-numeric args to fixnum"); \
+		int64_t x = ((fixnum*)argv[0])->val;							\
+		return alloc_fixnum(exp);										\
+	}	
 	INT_DYAD(plus, x + y)
 	INT_DYAD(minus, x - y)
 	INT_DYAD(mul, x * y)
@@ -160,6 +170,14 @@ namespace prim {
 	INT_DYAD(mod_, mod(x, y))
 	DYAD(cons, { return alloc_cons(lhs, rhs); })
 	MONAD(write_, { write(arg); return NULL; })
+	INT_MONAD(peekq, *(uint64_t*)x)
+	INT_MONAD(peekd, *(uint32_t*)x)
+	INT_MONAD(peeks, *(uint16_t*)x)
+	INT_MONAD(peekb, *(uint8_t*)x)
+	DYAD(pokeq, { *((uint64_t*)as<fixnum>(lhs)->val) = as<fixnum>(rhs)->val; return NULL; })
+	DYAD(poked, { *((uint32_t*)as<fixnum>(lhs)->val) = as<fixnum>(rhs)->val; return NULL; })
+	DYAD(pokes, { *((uint16_t*)as<fixnum>(lhs)->val) = as<fixnum>(rhs)->val; return NULL; })
+	DYAD(pokeb, { *((uint8_t*)as<fixnum>(lhs)->val) = as<fixnum>(rhs)->val; return NULL; })
 }
 
 inline object *car(object *obj) {
@@ -172,7 +190,7 @@ inline object *cdr(object *obj) {
 	return ((cons*)obj)->cdr;
 }
 
-object *lookup(symentry *sym) {
+object *lookup(symbol *sym) {
 	for (size_t i = 0; i < globalind; ++i) {
 		if (globals[i].sym == sym) {
 			return globals[i].val;
@@ -201,12 +219,24 @@ object *nth(size_t i, object *list) {
 	return car(list);
 }
 
-bool builtin(symentry *name, object *args, env *env, object **ret) {
+bool builtin(symbol *name, object *args, env *env, object **ret) {
 	if (name == sym_def) {
 		assert(length(args) == 2 && type_of(nth(0, args)) == tsymbol, "Bad def");
-		symentry *sym = ((symbol*)nth(0, args))->sym;
+		symbol *sym = (symbol*)nth(0, args);
 		add_global(sym, eval(nth(1, args), env), 0);
 		*ret = nullptr;
+		return true;
+	} else if (name == sym_quote) {
+		assert(length(args) == 1, "Bad quote");
+		*ret = car(args);
+		return true;
+	} else if (name == sym_if) {
+		assert(length(args) == 3, "Bad if");
+		if(eval(nth(0, args), env) != NULL) {
+			*ret = eval(nth(1, args), env);
+		} else {
+			*ret = eval(nth(2, args), env);
+		}
 		return true;
 	} else {
 		return false;
@@ -218,7 +248,7 @@ object *apply(object *func, object *args, env *env) {
 	// write(func);
 	// puts("\n");
 	object *ret;
-	if (type_of(func) == tsymbol && builtin(((symbol*)func)->sym, args, env, &ret)) {
+	if (type_of(func) == tsymbol && builtin((symbol*)func, args, env, &ret)) {
 		return ret;
 	} else {
 		object *func1 = eval(func, env);
@@ -253,7 +283,7 @@ object *eval(object *val, env *env) {
 	case tfixnum:
 	case tcfunc:
 	case tclosure: return val;
-	case tsymbol: return lookup(((symbol*)val)->sym);
+	case tsymbol: return lookup((symbol*)val);
 	case tcons: return apply(car(val), cdr(val), env);
 	default:
 		fail("Bad object in eval");
@@ -301,8 +331,7 @@ symbol *read_sym(const char **str) {
 	}
 	const char *begin = *str;
 	*str += length;
-	symentry *sym = intern_strl(begin, length);
-	return alloc_symbol(sym);
+	return intern_strl(begin, length);
 }
 
 object *read_string(const char **str) {
@@ -333,6 +362,14 @@ object *read_string(const char **str) {
 		}
 	} else if (issymchar(chr)) {
 		return read_sym(str);
+	} else if (chr == '\'') {
+		*str += 1;
+		return alloc_cons(sym_quote, alloc_cons(read_string(str), NULL));
+	} else if (chr == ';') {
+		while (**str != '\n') {
+			*str += 1;
+		}
+		return read_string(str);
 	} else {
 		fail("tried to read something weird");
 	}
@@ -365,7 +402,7 @@ void write(object *obj) {
 		puti(((fixnum*)obj)->val);
 		break;
 	case tsymbol:
-		putsym(((symbol*)obj)->sym);
+		putsym((symbol*)obj);
 		break;
 	case tcons:
 		write_list(obj);
@@ -385,6 +422,8 @@ void lisp_init(uint8_t *memory, size_t memlen) {
 	setup_arena(memory, memlen);
 
 	sym_def = intern_cstr("def");
+	sym_quote = intern_cstr("quote");
+	sym_if = intern_cstr("if");
 	add_primop("+", prim::plus);
 	add_primop("-", prim::minus);
 	add_primop("*", prim::mul);
@@ -392,6 +431,15 @@ void lisp_init(uint8_t *memory, size_t memlen) {
 	add_primop("%", prim::mod_);
 	add_primop("cons", prim::cons);
 	add_primop("write", prim::write_);
+	add_primop("@", prim::peekq);
+	add_primop("@4", prim::peekd);
+	add_primop("@2", prim::peeks);
+	add_primop("@1", prim::peekb);
+	add_primop("!", prim::pokeq);
+	add_primop("!4", prim::poked);
+	add_primop("!2", prim::pokes);
+	add_primop("!1", prim::pokeb);
+		
 
 	const char *str = &lispcode;
 	do {

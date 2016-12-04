@@ -1,17 +1,16 @@
 #pragma once
 
-enum tag {
+#include <stdint.h>
+
+enum tag : uint8_t {
 	tnil, tfixnum, tsymbol, tcons, tcfunc, tclosure
 };
 
 struct object;
+struct symbol;
 
-struct symentry {
-	uint8_t length;
-	uint8_t chars[];
-};
 struct binding {
-	symentry *sym;
+	symbol *sym;
 	object *val;
 	int is_macro;
 };
@@ -28,7 +27,8 @@ struct fixnum : object {
 	static const tag ttag = tfixnum;
 };
 struct symbol : object {
-	symentry *sym;
+	uint8_t length;
+	uint8_t chars[];
 	static const tag ttag = tsymbol;
 };
 struct cons : object {
